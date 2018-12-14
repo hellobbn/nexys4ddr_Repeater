@@ -43,9 +43,13 @@ module sdcard_controller(
     output                  o_ready,        // The card is ready
     input [31:0]            i_address,      // Write or Read address
     input                   i_clk,          // Clock from higer level
+    input                   clk_100mhz,
 
     // DEBUG
-    output [4:0]            o_status        // DEBUG: the current state
+    output [4:0]            o_status,       // DEBUG: the current state
+    
+    // uart
+    output wire uart_txd
     );
 
     // Set FSM STATE
@@ -55,7 +59,8 @@ module sdcard_controller(
     parameter CMD55 = 3;                    // CMD55 -> APP_CMD
     parameter CMD41 = 4;                    // CMD41 -> Reserved
     parameter POLL_CMD = 5;
-
+    
+    // parm for read and write
     parameter IDLE = 6;
     parameter READ_BLOCK = 7;
     parameter READ_BLOCK_WAIT = 8;
@@ -70,8 +75,97 @@ module sdcard_controller(
     parameter WRITE_BLOCK_BYTE = 17;
     parameter WRITE_BLOCK_WAITE = 18;
 
+    // We have 1 start bit and 2 ending bits
     parameter WRITE_DATA_SIZE = 515;
 
+    // UART Message
+    reg [7:0] sd_CMD0_message [0:15];
+    reg [7:0] sd_CMD41_message [0:15];
+    reg [7:0] sd_R1_message [0:15];
+    
+    reg [7:0] uart_tx_message;
+    reg cmd0_enable;
+    reg cmd41_enable;
+    reg r1_enable;
+    reg messageindex;
+    reg cmd0_len = 8;
+    reg cmd41_len = 9;
+    reg r1_len = 4;
+    reg whole_enable;
+    wire uart_enable;
+    wire uart_busy;
+    
+    initial begin
+        cmd0_enable = 0;
+        cmd41_enable = 0;
+        r1_enable = 0;
+        messageindex = 0;
+        whole_enable = 0;
+        sd_CMD0_message[0] = "[";
+        sd_CMD0_message[1] = "C";
+        sd_CMD0_message[2] = "M";
+        sd_CMD0_message[3] = "D";
+        sd_CMD0_message[4] = "0";
+        sd_CMD0_message[5] = "]";
+        sd_CMD0_message[6] = ":";
+        sd_CMD0_message[7] = " ";
+        
+        sd_CMD41_message[0] = "[";
+        sd_CMD41_message[1] = "C";
+        sd_CMD41_message[2] = "M";
+        sd_CMD41_message[3] = "D";
+        sd_CMD41_message[4] = "4";
+        sd_CMD41_message[5] = "1";
+        sd_CMD41_message[6] = "]";
+        sd_CMD41_message[7] = ":";
+        sd_CMD41_message[8] = " "; 
+               
+        sd_R1_message[0] = "R";
+        sd_R1_message[1] = "1";
+        sd_R1_message[2] = "\r";
+        sd_R1_message[3] = "\n";
+    end
+    
+    always @(posedge clk_100mhz) begin
+        messageindex = messageindex + 1;
+        if(cmd0_enable) begin
+            if(messageindex == cmd0_len) begin
+                whole_enable <= 0;
+            end
+        end
+        else if(cmd41_enable) begin
+            if(messageindex == cmd41_len) begin
+                whole_enable <= 0;
+            end
+        end
+        else if(r1_enable) begin
+            if(messageindex == r1_len) begin
+                whole_enable <= 0;
+            end
+        end
+        else begin
+            whole_enable <= 1;
+        end
+    end
+    
+   assign uart_enable = whole_enable & (cmd0_enable | cmd41_enable | r1_enable) & (!uart_busy);
+    
+    always @(posedge clk_100mhz) begin
+        if(cmd0_enable) begin
+            uart_tx_message <= sd_CMD0_message[messageindex];
+        end
+        else if(cmd41_enable) begin
+            uart_tx_message <= sd_CMD41_message[messageindex];
+        end
+        else if(r1_enable) begin
+            uart_tx_message <= sd_R1_message[messageindex];
+        end
+    end
+    
+    uart_tx uart_serial(.clk(clk_100mhz), .resetn(1), .uart_txd(uart_txd), .uart_tx_busy(uart_busy), .uart_tx_en(uart_enable), .uart_tx_data(uart_tx_message));
+    // ========== UART ENDS HERE =========
+    
+    parameter spiClk_div = 5;
     reg [4:0] state = RST;
     reg [4:0] return_state;
     reg sclk_sig = 0;
@@ -82,8 +176,7 @@ module sdcard_controller(
 
     reg [9:0] byte_counter;
     reg [9:0] bit_counter;
-    
-    reg [26:0] boot_counter;
+    reg [26:0] boot_counter = 27'd100_000_000;
 
     assign o_status = state;
     assign o_sclk = sclk_sig;
@@ -95,7 +188,7 @@ module sdcard_controller(
         if(i_reset == 1) begin
             state <= RST;
             sclk_sig <= 0;
-            boot_counter <= 27'd100_000_000;
+            boot_counter = 27'd100_000_000;
         end
         else begin
             case(state)
@@ -107,7 +200,7 @@ module sdcard_controller(
                         o_byte_avai <= 0;
                         o_ready_write <= 0;
                         cmd_mode <= 1;
-                        bit_counter <= 160;                 // bit count is 160 because we need to wait for some clocks (Supply Ramp up time)
+                        bit_counter <= 160;                 // bit count is 160 because we need to wait for some clocks (Supply Ramp up time), it is 80 spi Clock;
                         o_cs = 1;
                         state <= INIT;
                     end
@@ -116,7 +209,7 @@ module sdcard_controller(
                     end
                 end
                 INIT: begin                                     // Wait for certain clock cycles and send CMD0
-                    if(boot_counter == 0) begin
+                    if(bit_counter == 0) begin
                         o_cs <= 0;
                         state <= CMD0;
                     end
@@ -126,24 +219,28 @@ module sdcard_controller(
                     end
                 end
                 CMD0: begin
+                    cmd0_enable <= 1;
                     cmd_out <= 56'hFF_40_00_00_00_00_95;
                     bit_counter <= 55;
                     return_state <= CMD55;
                     state <= SEND_CMD;
                 end
                 CMD55: begin
+                    cmd0_enable <= 0;
                     cmd_out <= 56'hFF_77_00_00_00_00_01;        // 1111_1111_0111_0111_0000_...._0001, (A)CMD55
                     bit_counter <= 55;
                     return_state <= CMD41;
                     state <= SEND_CMD;
                 end
                 CMD41: begin
+                    cmd41_enable <= 1;
                     cmd_out <= 56'hFF_69_00_00_00_00_01;        // 1111_1111_0110_1001_0000_...._0001, ACMD41
                     bit_counter <= 55;
                     return_state <= POLL_CMD;
                     state <= SEND_CMD;
                 end
-                POLL_CMD: begin                                 // Check if Init succeed
+                POLL_CMD: begin  
+                    cmd41_enable <= 0;                               // Check if Init succeed
                     if(recv_data[0] == 0) begin
                         state <= IDLE;
                     end
@@ -162,7 +259,7 @@ module sdcard_controller(
                         state <= IDLE;                          // Waiting for the command
                     end
                 end
-                READ_BLOCK: begin                               // Start Read the SD Card
+                READ_BLOCK: begin                               // Init read command
                     cmd_out <= {16'hFF_51, i_address, 8'hFF};   // Command 1111_1111_0101_0001_..._1111_1111, CMD17, argument is the address
                     bit_counter <= 55;
                     return_state <= READ_BLOCK_WAIT;
@@ -215,7 +312,7 @@ module sdcard_controller(
                             recv_data <= 0;
                             bit_counter <= 6;                       // Receive the other 6 bits
                             state <= RECEIVE_BYTE;
-                        end
+                        end                                         // DO NOTHING
                     end
                     sclk_sig <= ~sclk_sig;
                 end
@@ -230,7 +327,7 @@ module sdcard_controller(
                             bit_counter <= bit_counter - 1;
                         end
                     end
-                    sclk_sig = ~sclk_sig;
+                    sclk_sig <= ~sclk_sig;
                 end
                 WRITE_BLOCK_CMD: begin
                     cmd_out <= {16'hFF_58, i_address, 8'hFF};   // Command 1111_1111_0101_1000_...._1111_1111 -> CMD24, WRITE_BLOCK
@@ -252,7 +349,7 @@ module sdcard_controller(
                     end
                     else begin
                         if((byte_counter == 2) || (byte_counter == 1)) begin
-                            data_sig <= 8'hFF;
+                            data_sig <= 8'hFF;                  // End Command
                         end
                         else if(byte_counter == WRITE_DATA_SIZE) begin
                             data_sig <= 8'hFE;

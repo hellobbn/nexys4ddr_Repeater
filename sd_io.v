@@ -28,7 +28,8 @@ module sd_io(
     output              SD_CMD,
     inout [3:0]         SD_DAT,
     output [15:0]       LED,
-    input               BTNC
+    input               BTNC,
+    output wire         uart_txd
     );
 
     wire clk_100mhz = CLK100MHZ;
@@ -68,7 +69,7 @@ module sd_io(
     wire byte_available;
     wire ready;
     wire ready_for_next_byte;
-    reg [31:0] adr = 32'h00_00_00_00;
+    reg [31:0] adr = 32'h00_00_10_00;
     
     reg [15:0] bytes = 0;
     reg [1:0] bytes_read = 0;
@@ -87,7 +88,7 @@ module sd_io(
             .i_data_in(din), .o_read_data(dout), .o_byte_avai(byte_available),
             .o_ready(ready), .i_address(adr), 
             .o_ready_write(ready_for_next_byte), .i_clk(clk_25mhz), 
-            .o_status(state));
+            .o_status(state), .clk_100mhz(CLK100MHZ), .uart_txd(uart_txd));
     
 
     always @(posedge clk_25mhz) begin
@@ -105,11 +106,11 @@ module sd_io(
                     if(ready) begin
                         test_state <= STATE_START;
                         wr <= 1;
-                        din <= 8'hAA;
+                        din <= 8'hCC;
                     end
                 end
                 STATE_START: begin
-                    if(ready == 0) begin
+                    if(ready == 0) begin                    // state != IDLE
                         test_state <= STATE_WRITE;
                         wr <= 0;
                     end
@@ -120,7 +121,7 @@ module sd_io(
                         rd <= 1;
                     end
                     else if(ready_for_next_byte) begin
-                        din <= 8'hAA;
+                        din <= 8'hCC;
                     end
                 end
                 STATE_READ: begin
